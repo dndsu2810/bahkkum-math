@@ -8,6 +8,7 @@ var allRequests=[]
 var allOrders=[]
 var menuCfg={learn:[],fine:[],shop:[]}
 var curCfg={unit:'포인트',symbol:'P',desc:''}
+var shopMaxPerOrder=0
 
 function emptyHtml(msg){
   var d=document.createElement('div')
@@ -97,6 +98,9 @@ function loadConfig(){
   fetch('/api/config').then(function(r){return r.json()}).then(function(cfg){
     menuCfg=cfg.menu||JSON.parse(JSON.stringify(DEFAULT_MENU))
     curCfg={unit:'포인트',symbol:'star',desc:'포인트를 모아 간식과 바꿔요'}
+    shopMaxPerOrder=+(cfg.shopMaxPerOrder)||0
+    var mpo=document.getElementById('shopMaxPerOrder')
+    if(mpo)mpo.value=shopMaxPerOrder
     renderMenuItems('shop')
   }).catch(function(){
     menuCfg=JSON.parse(JSON.stringify(DEFAULT_MENU))
@@ -104,7 +108,7 @@ function loadConfig(){
 }
 
 function saveConfigToServer(callback){
-  var cfg={currency:curCfg,menu:menuCfg}
+  var cfg={currency:curCfg,menu:menuCfg,shopMaxPerOrder:shopMaxPerOrder}
   api('/api/admin/config',{method:'POST',body:JSON.stringify(cfg)}).then(function(d){
     if(d.success){
       if(callback)callback()
@@ -579,6 +583,8 @@ document.getElementById('savemenuBtn').addEventListener('click',function(){
       }
     })
   })
+  var mpoInp=document.getElementById('shopMaxPerOrder')
+  if(mpoInp) shopMaxPerOrder=+(mpoInp.value)||0
   saveConfigToServer(function(){ toast('메뉴 저장 완료! 키오스크에 즉시 반영됩니다.') })
 })
 
