@@ -994,6 +994,13 @@ app.post('/api/submit', async (c) => {
         ).first() as any
         if (configRow?.value) {
           const config = JSON.parse(configRow.value)
+          const maxPerOrder = Number(config.shopMaxPerOrder || 0)
+          if (maxPerOrder > 0) {
+            const totalQty = items.reduce((a: number, x: any) => a + Number(x.qty || 0), 0)
+            if (totalQty > maxPerOrder) {
+              return c.json({ success: false, error: `한 번에 ${maxPerOrder}개까지 담을 수 있어요` }, 400)
+            }
+          }
           const shopItems: any[] = config.menu?.shop || []
           for (const item of items) {
             const menuItem = shopItems.find((s: any) => s.id === item.id)
@@ -3548,7 +3555,7 @@ document.addEventListener('click',function(e){
 
       const ex=ST.cart.find(x=>x.id===ctrl.dataset.id&&x.tab===ctrl.dataset.tab)
 
-      if(ex){ex.qty++;updateCartBar();renderMenu()}
+      if(ex&&canAddShop(ex.tab,1)){ex.qty++;updateCartBar();renderMenu()}
 
     }
 
@@ -3594,6 +3601,14 @@ document.addEventListener('click',function(e){
 
 // 장바구니
 
+function canAddShop(tab,add){
+  const max=Number(CFG.shopMaxPerOrder||0)
+  if(tab!=='shop'||max<=0)return true
+  const cur=ST.cart.reduce((a,x)=>a+(x.tab==='shop'?x.qty:0),0)
+  if(cur+add>max){toast('한 번에 '+max+'개까지 담을 수 있어요');return false}
+  return true
+}
+
 window.addToCart=function(id,tab){
 
   const item=(CFG.menu[tab]||[]).find(x=>x.id===id);if(!item)return
@@ -3608,6 +3623,8 @@ window.addToCart=function(id,tab){
 }
 
 function pushCart(item,tab,photo,comment){
+
+  if(!canAddShop(tab,1))return
 
   const ex=ST.cart.find(x=>x.id===item.id&&x.tab===tab)
 
@@ -3924,7 +3941,7 @@ window.doSubmit=async function(){
 
         name:ST.student.name,
 
-        items:ST.cart.map(x=>({icon:x.icon,label:x.label,qty:x.qty,tab:x.tab,comment:x.comment||'',fineType:x.fineType||'point',unit:x.unit||''})),
+        items:ST.cart.map(x=>({id:x.id,icon:x.icon,label:x.label,qty:x.qty,tab:x.tab,comment:x.comment||'',fineType:x.fineType||'point',unit:x.unit||''})),
 
         totalCost:tc,
 
@@ -5350,6 +5367,12 @@ const ADMIN_HTML = `<!DOCTYPE html>
               <span style="font-size:10px;color:var(--g400);text-align:center;">월재고</span>
             </div>
             <button class="btn btn-blue btn-sm" id="addShopBtn">추가</button>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:12px;border-top:1.5px solid var(--g200);flex-wrap:wrap;">
+            <span style="font-size:12px;font-weight:700;">한 번에 담을 수 있는 총 개수</span>
+            <input class="inp" id="shopMaxPerOrder" type="number" min="0" placeholder="0" style="width:70px;"/>
+            <span style="font-size:11px;color:var(--g400);">0이면 제한 없어요</span>
           </div>
 
         </div>
