@@ -330,14 +330,17 @@ function renderOrderList(){
     var costVal=o.total_cost
     var cc=costVal===0?'free':costVal<0?'gain':'loss'
     var ct=costVal===0?'무료':costVal<0?'+'+Math.abs(costVal)+' '+o.currency+' 획득':'-'+costVal+' '+o.currency+' 차감'
-    var tm=o.created_at?o.created_at.slice(0,16).replace('T',' '):''
-    return '<div class="order-item">'+
+    var tm=kstTime(o.created_at)
+    var refQty=items.reduce(function(a,x){return a+(+x.refunded||0)},0)
+    var allQty=items.reduce(function(a,x){return a+(+x.qty||0)},0)
+    var refTag=refQty?'<span style="font-size:10px;background:var(--red);color:white;padding:2px 6px;border-radius:100px;font-weight:800;">'+(refQty>=allQty?'전액 환불':'부분 환불')+'</span>':''
+    return '<div class="order-item clickable" onclick="openReceipt('+o.id+')">'+
       '<div class="order-cat '+o.category+'">'+(catEmoji[o.category]||'기타')+'</div>'+
       '<div class="order-body">'+
         '<div class="order-top">'+
           '<span class="order-stu">'+esc(o.student_name)+'</span>'+
           '<span class="order-time">'+tm+'</span>'+
-          (o.has_photo?'<span style="font-size:10px;background:var(--orange);color:white;padding:2px 6px;border-radius:100px;font-weight:800;">사진</span>':'')+
+          (o.has_photo?'<span style="font-size:10px;background:var(--orange);color:white;padding:2px 6px;border-radius:100px;font-weight:800;">사진</span>':'')+refTag+
         '</div>'+
         '<div class="order-items-txt">'+esc(itemsTxt)+'</div>'+
         (o.comment?'<div style="font-size:11px;color:var(--indigo);margin-top:2px;">'+esc(o.comment)+'</div>':'')+
@@ -346,6 +349,71 @@ function renderOrderList(){
     '</div>'
   }).join('')
 }
+
+// orders.created_at은 UTC(CURRENT_TIMESTAMP) → KST 'YYYY-MM-DD HH:MM'
+function kstTime(t){
+  if(!t)return ''
+  var d=new Date(String(t).replace(' ','T')+'Z')
+  if(isNaN(d))return String(t).slice(0,16)
+  return new Date(d.getTime()+9*3600*1000).toISOString().slice(0,16).replace('T',' ')
+}
+
+// ══ 영수증·부분 환불 ══
+var rcptOrder=null,rcptItems=[],rcptPick=[]
+function openReceipt(id){
+  rcptOrder=allOrders.find(function(o){return o.id===id})
+  if(!rcptOrder)return
+  try{rcptItems=JSON.parse(rcptOrder.items_json)}catch(e){rcptItems=[]}
+  rcptPick=rcptItems.map(function(){return 0})
+  renderReceipt()
+  document.getElementById('rcpt-modal').classList.add('open')
+}
+window.openReceipt=openReceipt
+function closeReceipt(){document.getElementById('rcpt-modal').classList.remove('open')}
+window.closeReceipt=closeReceipt
+
+function renderReceipt(){
+  var o=rcptOrder,cur=esc(o.currency||'포인트'),shop=o.category==='shop'
+  var rows=rcptItems.map(function(x,i){
+    var cost=+x.cost||0,qty=+x.qty||0,ref=+x.refunded||0,left=qty-ref
+    var sub='<span>'+cost+' × '+qty+(ref?' <span class="rcpt-ref">(환불 '+ref+')</span>':'')+'</span>'
+    if(shop&&left>0)sub+='<span class="rcpt-step">환불 <button onclick="rcptStep('+i+',-1)">-</button><b>'+rcptPick[i]+'</b><button onclick="rcptStep('+i+',1)">+</button></span>'
+    return '<div class="rcpt-row'+(left<=0?' done':'')+'"><b>'+esc(x.label)+'</b><span>'+(cost*qty)+'</span><div class="sub">'+sub+'</div></div>'
+  }).join('')
+  var refunded=rcptItems.reduce(function(a,x){return a+(+x.cost||0)*(+x.refunded||0)},0)
+  var pick=rcptItems.reduce(function(a,x,i){return a+(+x.cost||0)*rcptPick[i]},0)
+  var html='<div class="rcpt"><div class="rcpt-meta">주문번호 '+o.id+'<br>'+esc(o.student_name)+' · '+kstTime(o.created_at)+'</div>'+rows+
+    '<div class="rcpt-sum"><span>합계</span><span>'+o.total_cost+' '+cur+'</span></div>'+
+    (refunded?'<div class="rcpt-sum rcpt-ref" style="padding-top:0;"><span>환불됨</span><span>-'+refunded+' '+cur+'</span></div>':'')+
+    (o.comment?'<div style="font-size:12px;color:var(--g600);">코멘트: '+esc(o.comment)+'</div>':'')
+  if(shop&&rcptItems.some(function(x){return (+x.qty||0)>(+x.refunded||0)})){
+    html+='<button class="btn btn-red" style="width:100%;margin-top:12px;justify-content:center;" onclick="submitRefund()"'+(pick?'':' disabled')+'>'+(pick?pick+' '+cur+' 환불하기':'환불할 수량을 골라 주세요')+'</button>'
+  }else if(!shop){
+    html+='<div style="font-size:12px;color:var(--g400);margin-top:10px;">환불은 상점 주문만 할 수 있어요.</div>'
+  }
+  document.getElementById('rcptBody').innerHTML=html+'</div>'
+}
+function rcptStep(i,d){
+  var x=rcptItems[i],left=(+x.qty||0)-(+x.refunded||0)
+  rcptPick[i]=Math.max(0,Math.min(left,rcptPick[i]+d))
+  renderReceipt()
+}
+window.rcptStep=rcptStep
+function submitRefund(){
+  var refunds=rcptPick.map(function(q,i){return {idx:i,qty:q}}).filter(function(r){return r.qty>0})
+  if(!refunds.length)return
+  var o=rcptOrder
+  if(!confirm(o.student_name+' 학생에게 환불할까요? 포인트와 재고가 돌아가요.'))return
+  api('/api/admin/orders/'+o.id+'/refund',{method:'POST',body:JSON.stringify({refunds:refunds})}).then(function(d){
+    if(!d||!d.success){toast('환불 실패: '+((d&&d.error)||''));return}
+    o.items_json=JSON.stringify(d.items)
+    toast(d.amount+' '+(o.currency||'포인트')+' 환불했어요')
+    openReceipt(o.id)
+    renderOrderList()
+    loadStudentsData()
+  }).catch(function(){toast('환불 중 오류가 났어요')})
+}
+window.submitRefund=submitRefund
 
 // ══ 포인트 교환 대출 ══
 var allLoans=[]

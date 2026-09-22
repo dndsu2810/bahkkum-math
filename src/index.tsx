@@ -15,6 +15,7 @@ type Bindings = {
   KAKAOWORK_WEBHOOK_ENGLISH: string  // 영어 카카오워크 웹훅 URL
 
   SLACK_BOT_TOKEN: string
+  SLACK_WEBHOOK_ORDER: string        // (선택) 주문·환불 알림 슬랙 Incoming Webhook. 없으면 수학 카카오워크
 
   SLACK_CHANNEL_ID: string
 
@@ -1580,13 +1581,60 @@ app.get('/api/admin/orders', async (c) => {
 
 })
 
+// 상점 주문 부분 환불: body.refunds=[{idx, qty}] (idx=items_json 위치). 환불 수량은 items[i].refunded에 누적
+app.post('/api/admin/orders/:id/refund', async (c) => {
+  const id = c.req.param('id')
+  const { refunds } = await c.req.json().catch(() => ({})) as any
+  const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id=?').bind(id).first() as any
+  if (!order) return c.json({ success: false, error: '주문을 찾을 수 없어요' }, 404)
+  if (order.category !== 'shop') return c.json({ success: false, error: '상점 주문만 환불할 수 있어요' }, 400)
+  const items: any[] = JSON.parse(order.items_json || '[]')
+  const picked: { item: any, qty: number }[] = []
+  for (const r of Array.isArray(refunds) ? refunds : []) {
+    const item = items[Number(r.idx)]
+    const qty = Math.floor(Number(r.qty))
+    if (!item || !(qty > 0)) continue
+    if (qty > Number(item.qty) - Number(item.refunded || 0)) return c.json({ success: false, error: `${item.label}: 환불 가능한 수량을 넘었어요` }, 400)
+    item.refunded = Number(item.refunded || 0) + qty
+    picked.push({ item, qty })
+  }
+  if (!picked.length) return c.json({ success: false, error: '환불할 항목을 골라 주세요' }, 400)
+  const amount = picked.reduce((a, p) => a + Number(p.item.cost || 0) * p.qty, 0)
+
+  // 같은 주문을 두 번 환불하지 않도록 items_json이 그대로일 때만 갱신
+  const upd = await c.env.DB.prepare('UPDATE orders SET items_json=? WHERE id=? AND items_json=?')
+    .bind(JSON.stringify(items), id, order.items_json).run()
+  if (!upd.meta.changes) return c.json({ success: false, error: '다른 곳에서 먼저 처리됐어요. 새로고침해 주세요' }, 409)
+
+  // 주문 시각(UTC) → KST 날짜: 일한도 로그·월재고를 그 날짜/달 기준으로 되돌림
+  const orderDate = new Date(new Date(String(order.created_at).replace(' ', 'T') + 'Z').getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+  const reason = '환불: ' + picked.map(p => `${p.item.label}×${p.qty}`).join(', ')
+  const stu = await c.env.DB.prepare('SELECT id FROM students WHERE name=?').bind(order.student_name).first() as any
+  const stmts: D1PreparedStatement[] = []
+  if (stu && amount > 0) {
+    stmts.push(c.env.DB.prepare('UPDATE students SET points = points + ? WHERE id=?').bind(amount, stu.id))
+    stmts.push(c.env.DB.prepare('INSERT INTO point_history (student_id, delta, reason, category, created_at) VALUES (?,?,?,?,?)')
+      .bind(stu.id, amount, reason, 'shop', getKSTTimestamp()))
+  }
+  for (const p of picked) {
+    const itemId = p.item.id || p.item.label
+    stmts.push(c.env.DB.prepare('INSERT INTO shop_purchase_log (item_id, student_id, student_name, qty, purchase_date) VALUES (?,?,?,?,?)')
+      .bind(itemId, stu?.id ?? null, order.student_name, -p.qty, orderDate))
+    stmts.push(c.env.DB.prepare('UPDATE shop_stock SET remaining_stock = remaining_stock + ?, updated_at = CURRENT_TIMESTAMP WHERE item_id=? AND month_key=?')
+      .bind(p.qty, itemId, orderDate.slice(0, 7)))
+  }
+  await c.env.DB.batch(stmts)
+  try { await sendKW(orderHook(c.env), `[환불] ${order.student_name}\n` + picked.map(p => `- ${p.item.label} × ${p.qty}`).join('\n') + `\n+${amount} ${order.currency} 돌려줌\n${getKSTTimestamp()}`) } catch (_) {}
+  return c.json({ success: true, amount, items })
+})
+
 
 
 app.get('/api/health', (c) => c.json({
 
   status: 'ok',
 
-  slack: !!c.env.SLACK_WEBHOOK_URL,
+  slack: !!c.env.SLACK_WEBHOOK_ORDER,
 
   notion: !!(c.env.NOTION_API_KEY && c.env.NOTION_DATABASE_ID),
 
@@ -1735,6 +1783,7 @@ async function sendKW(url: string, text: string) {
 }
 
 function kwMath(env: Bindings)    { return env.KAKAOWORK_WEBHOOK_MATH || '' }
+function orderHook(env: Bindings) { return env.SLACK_WEBHOOK_ORDER || kwMath(env) }
 function kwEnglish(env: Bindings) { return env.KAKAOWORK_WEBHOOK_ENGLISH || env.KAKAOWORK_WEBHOOK_MATH || '' }
 function kwCat(env: Bindings, cat: string) { return cat.includes('영어') ? kwEnglish(env) : kwMath(env) }
 
@@ -1773,8 +1822,8 @@ async function sendSlack(env: Bindings, d: any) {
   if (d.comment) kwLines.push('코멘트: ' + d.comment)
   kwLines.push(d.timestamp)
 
-  // 카카오워크 전송 (항상)
-  await sendKW(kwMath(env), kwLines.join('\n'))
+  // 슬랙 주문 웹훅(없으면 카카오워크) — 둘 다 {text} 평문이라 전송기는 같다
+  await sendKW(orderHook(env), kwLines.join('\n'))
 
   return true
 
@@ -4992,6 +5041,16 @@ const ADMIN_HTML = `<!DOCTYPE html>
     .modal-ov.open{display:flex;}
 
     .modal-box{background:var(--white);border-radius:20px;padding:28px 24px;width:min(520px,96vw);max-height:80vh;overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,.16);}
+    .rcpt{font-variant-numeric:tabular-nums;font-size:13px;}
+    .rcpt-meta{color:var(--g600);font-size:12px;line-height:1.7;padding-bottom:10px;border-bottom:1.5px dashed var(--g200);}
+    .rcpt-row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:10px 0;border-bottom:1px dashed var(--g200);}
+    .rcpt-row .sub{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--g400);}
+    .rcpt-row.done>b,.rcpt-row.done>span{color:var(--g400);text-decoration:line-through;}
+    .rcpt-step{display:inline-flex;align-items:center;gap:6px;color:var(--g600);}
+    .rcpt-step button{width:28px;height:28px;border-radius:8px;border:1.5px solid var(--g200);background:var(--white);font-weight:900;cursor:pointer;}
+    .rcpt-sum{display:flex;justify-content:space-between;padding:10px 0;font-weight:900;}
+    .rcpt-ref{color:var(--red);}
+    .order-item.clickable{cursor:pointer;}
 
     .modal-title{font-size:18px;font-weight:900;margin-bottom:16px;}
 
@@ -5465,6 +5524,17 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
 
 
+<!-- 주문 영수증·환불 모달 -->
+<div class="modal-ov" id="rcpt-modal" onclick="if(event.target===this)closeReceipt()">
+  <div class="modal-box" style="max-width:420px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <div class="modal-title" style="margin:0;">영수증</div>
+      <button class="btn btn-gray btn-sm" onclick="closeReceipt()"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div id="rcptBody"></div>
+  </div>
+</div>
+
 <!-- 포인트 이력 모달 -->
 
 <div class="modal-ov" id="hist-modal">
@@ -5529,7 +5599,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
     style="flex:1;width:100%;resize:none;border:none;outline:none;border-radius:14px;background:#2f4a3a;background-image:radial-gradient(rgba(255,255,255,.05) 1px, transparent 1.5px);background-size:20px 20px;color:#f7f7f0;font-family:'Gaegu',cursive;font-weight:700;font-size:clamp(32px,6vw,72px);line-height:1.3;text-align:center;padding:clamp(20px,4vh,60px) clamp(16px,3vw,40px);box-sizing:border-box;caret-color:#f7f7f0;"></textarea>
 </div>
 
-<script src="/static/admin.js?v=20260715a"></script>
+<script src="/static/admin.js?v=20260922a"></script>
 </body>
 
 </html>`
