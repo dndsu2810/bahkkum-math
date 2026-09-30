@@ -2504,7 +2504,7 @@ const MAIN_HTML = `<!DOCTYPE html>
 
   <button class="install-btn" id="installBtn" style="display:none" onclick="event.stopPropagation();installApp()"><span data-ic="plus" data-sz="18"></span>앱으로 설치하기</button>
 
-  <div class="sp-footer"><span style="letter-spacing:.12em">제작자</span> 이지현 선생님</div>
+  <div class="sp-footer"><span style="letter-spacing:.12em">제작자</span> EZ</div>
 
 </div>
 
