@@ -558,7 +558,14 @@ app.get('/api/students', async (c) => {
       FROM students s
       LEFT JOIN fines f ON f.student_id = s.id
       LEFT JOIN class_student_meta m ON m.student_id = CAST(s.id AS TEXT)
-      WHERE (m.subjects IS NULL OR m.subjects = '' OR m.subjects = '[]' OR m.subjects LIKE '%math%')
+      WHERE s.id = 9 -- EZ❤️: 지현 본인 계정이라 상태와 상관없이 항상 표시
+        OR ((m.subjects IS NULL OR m.subjects = '' OR m.subjects = '[]' OR m.subjects LIKE '%math%')
+        -- 쏘이지 '수학 재원생'과 같은 기준: 재원·숨김 아님·수학 종료일 안 지남·테스트 계정 아님
+        AND s.status = '재원' AND COALESCE(s.hidden, 0) = 0
+        AND (m.math_end IS NULL OR m.math_end = '' OR m.math_end >= date('now', '+9 hours'))
+        AND s.name NOT LIKE '테스트%' AND s.name NOT LIKE '테스터%' AND COALESCE(s.school, '') NOT LIKE '바꿈%'
+        -- 키오스크는 초등만
+        AND COALESCE(s.grade, '') NOT LIKE '중%' AND COALESCE(s.grade, '') NOT LIKE '고%')
       GROUP BY s.id ORDER BY s.name
     `).all()
     return c.json({ success: true, students: rows.results })
