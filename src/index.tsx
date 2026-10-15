@@ -1150,7 +1150,7 @@ async function ensurePointLoans(db: D1Database) {
   ).run()
 }
 
-// 쏘이지 '수학 보충수업(class_supplement)'에 대출을 기록 (best-effort, 공유 서비스키).
+// 쏘이지 수학 보충 수업에 오늘 '예정'으로 대출을 잡는다 (best-effort, 공유 서비스키).
 async function pushSoezSupplement(env: Bindings, d: { name: string, points: number, minutes: number, eventId: string }) {
   if (!env.SOEZ_BASE_URL || !env.EXTERNAL_POINTS_KEY) return { ok: false, reason: 'not_configured' }
   try {
@@ -2906,9 +2906,9 @@ const MAIN_HTML = `<!DOCTYPE html>
 <!-- 포인트 부족 → 대출 모달 -->
 <div class="modal-ov" id="loan-modal">
   <div class="modal-box">
-    <div class="modal-title" style="margin-bottom:13px"><span data-ic="star" data-sz="22"></span>포인트가 부족해요</div>
+    <div class="modal-title" style="margin-bottom:13px"><span data-ic="star" data-sz="22"></span>포인트를 대출할까요?</div>
     <div id="loanBody" style="font-size:15px;line-height:1.7;color:var(--ink);margin-bottom:10px"></div>
-    <div style="font-size:12px;color:var(--g400);line-height:1.6;margin-bottom:14px">대출하면 부족한 포인트를 빌리고, 그만큼 <b>오늘 추가 보충수업</b>을 해야 해요.<br>10포인트 = 1분 · 미상환 최대 3건까지</div>
+    <div style="font-size:12px;color:var(--g400);line-height:1.6;margin-bottom:14px">보충은 다른 날로 미룰 수 없어요. 오늘 꼭 남아야 해요.<br>10포인트 = 1분 · 갚지 않은 대출은 3건까지 할 수 있어요</div>
     <div class="modal-btns">
       <button class="btn-mc" onclick="closeLoan()"><span data-ic="close" data-sz="15" style="margin-right:4px;display:inline-block;vertical-align:-2px"></span>취소</button>
       <button class="btn-mok" id="loanOk" onclick="doLoan()"><span data-ic="star" data-sz="17"></span><span id="loanTxt">대출하고 주문하기</span></button>
@@ -3916,7 +3916,7 @@ window.closeLoan=function(){document.getElementById('loan-modal').classList.remo
 function offerLoan(need,shortfall){
   ST.loanNeed=need
   const min=Math.ceil((shortfall||0)/10)
-  document.getElementById('loanBody').innerHTML='지금 <b>'+shortfall+' '+CFG.currency.unit+'</b>이 부족해요.<br>대출하면 <b>'+shortfall+' '+CFG.currency.unit+'</b>을 빌리고, 오늘 <b>'+min+'분</b> 추가 보충수업을 하게 돼요.'
+  document.getElementById('loanBody').innerHTML='지금 <b>'+shortfall+' '+CFG.currency.unit+'</b>이 부족해요.<br>대출하면 <b>오늘 수업이 끝나고 '+min+'분 더 남아서</b> 수학 보충을 해야 해요.'
   const b=document.getElementById('loanOk');b.disabled=false;document.getElementById('loanTxt').textContent='대출하고 주문하기'
   document.getElementById('loan-modal').classList.add('open')
 }
