@@ -1238,176 +1238,93 @@ function getKSTTimestamp() {
   return n.toISOString().slice(0, 19).replace('T', ' ')
 }
 
+// ══ 번호표 — 쏘이지 수학 번호표(class_queue, subject='math')와 같은 줄을 쓴다(2026-11-18 지현) ══
+// 쏘이지 규칙 그대로: 오늘 안 끝난 번호표가 있으면 그 번호를 다시 보여 주고, 없으면 새로 뽑는다.
+// 쏘이지 상태 'called' = 키오스크 화면의 'answering'(호출됨). 옛 queue 테이블은 더 안 쓴다.
+let classQueueReady = false
+async function ensureClassQueue(db: D1Database) {
+  if (classQueueReady) return
+  await db.prepare("CREATE TABLE IF NOT EXISTS class_queue (id TEXT PRIMARY KEY, subject TEXT NOT NULL, student_id TEXT NOT NULL, student_name TEXT NOT NULL DEFAULT '', number INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'waiting', raised INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0, called_at INTEGER NOT NULL DEFAULT 0, done_at INTEGER NOT NULL DEFAULT 0)").run()
+  try { await db.prepare("ALTER TABLE class_queue ADD COLUMN reason TEXT NOT NULL DEFAULT ''").run() } catch (_) {}
+  classQueueReady = true
+}
+// 쏘이지 행 → 키오스크 화면이 쓰던 모양
+function kioskTicket(r: any) {
+  const status = r.status === 'called' ? 'answering' : String(r.status)
+  const kst = r.created_at ? new Date(Number(r.created_at) + 9 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ') : ''
+  return { id: r.id, number: Number(r.number), student_name: r.student_name, date: r.date, status, called: status === 'done' ? 2 : status === 'answering' ? 1 : 0, created_at: kst, reason: r.reason || '' }
+}
+async function mathTickets(db: D1Database, date: string) {
+  await ensureClassQueue(db)
+  const rows = await db.prepare("SELECT * FROM class_queue WHERE subject='math' AND date=? ORDER BY number ASC").bind(date).all()
+  return (rows.results as any[]).map(kioskTicket)
+}
+
 app.post('/api/queue/draw', async (c) => {
-
   try {
-
     const { studentName } = await c.req.json()
-
     if (!studentName) return c.json({ success: false, error: '이름 필요' }, 400)
-
+    const db = c.env.DB
+    await ensureClassQueue(db)
     const today = getKSTDate()
-
-
-
-    // 오늘 이미 번호표 뽑았는지 (완료 상태면 재발급 허용)
-
-    const existing = await c.env.DB.prepare(
-
-      "SELECT * FROM queue WHERE student_name=? AND date=? ORDER BY created_at DESC LIMIT 1"
-
-    ).bind(studentName, today).first() as any
-
-
-
-    if (existing && existing.status !== 'done') {
-
-      return c.json({ success: false, error: 'already_drawn', message: '오늘 이미 번호표를 뽑았어요 선생님이 완료 처리 후 재발급 가능해요.' })
-
+    const stu = await db.prepare('SELECT id, name FROM students WHERE name=?').bind(studentName).first() as any
+    if (!stu) return c.json({ success: false, error: 'no_student', message: '학생을 찾지 못했어요. 선생님께 말해 주세요.' })
+    const sid = String(stu.id)
+    let t = await db.prepare("SELECT number FROM class_queue WHERE subject='math' AND student_id=? AND date=? AND status!='done' ORDER BY created_at DESC LIMIT 1").bind(sid, today).first() as any
+    const existing = !!t
+    if (!t) {
+      const mx = await db.prepare("SELECT COALESCE(MAX(number),0)+1 n FROM class_queue WHERE subject='math' AND date=?").bind(today).first() as any
+      const number = Number(mx?.n ?? 1)
+      const id = 'q_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+      await db.prepare("INSERT INTO class_queue(id,subject,student_id,student_name,number,date,status,raised,created_at,reason) VALUES(?,'math',?,?,?,?,'waiting',0,?,'')")
+        .bind(id, sid, stu.name, number, today, Date.now()).run()
+      t = { number }
     }
-
-
-
-    // 직전 번호표 발급자 체크 (연속 발급 방지, 완료된 경우 제외)
-
-    const lastTicket = await c.env.DB.prepare(
-
-      "SELECT * FROM queue WHERE date=? AND status != 'done' ORDER BY created_at DESC LIMIT 1"
-
-    ).bind(today).first() as any
-
-
-
-    if (lastTicket && lastTicket.student_name === studentName) {
-
-      return c.json({ success: false, error: 'consecutive', message: '방금 전에도 내가 뽑았어요 친구에게 양보해요' })
-
-    }
-
-
-
-    // 오늘 마지막 번호 조회
-
-    const maxRow = await c.env.DB.prepare(
-
-      'SELECT MAX(number) as maxNum FROM queue WHERE date=?'
-
-    ).bind(today).first() as any
-
-    const nextNum = (maxRow?.maxNum || 0) + 1
-
-
-
-    // 번호표 발급
-
-    await c.env.DB.prepare(
-
-      "INSERT INTO queue (number, student_name, date, status) VALUES (?,?,?,'waiting')"
-
-    ).bind(nextNum, studentName, today).run()
-
-
-
-    // 대기 인원 (내 앞, waiting/answering 상태만)
-
-    const waitingRow = await c.env.DB.prepare(
-
-      "SELECT COUNT(*) as cnt FROM queue WHERE date=? AND number < ? AND status IN ('waiting','answering')"
-
-    ).bind(today, nextNum).first() as any
-
-    const waiting = waitingRow?.cnt || 0
-
-
-
-    // 슬랙 알림
-
-    const ts = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })
-
-    await sendSlackQueue(c.env, { studentName, number: nextNum, waiting, date: today, ts })
-
-
-
-    return c.json({ success: true, number: nextNum, waiting, date: today })
-
+    const a = await db.prepare("SELECT COUNT(*) n FROM class_queue WHERE subject='math' AND date=? AND status!='done' AND number<?").bind(today, t.number).first() as any
+    const waiting = Number(a?.n ?? 0)
+    return c.json({ success: true, number: t.number, waiting, date: today, existing })
   } catch (e: any) {
-
     return c.json({ success: false, error: e.message }, 500)
-
   }
-
 })
-
-
 
 // 번호표 현황 조회
-
 app.get('/api/queue/status', async (c) => {
-
   try {
-
-    const today = getKSTDate()
-
-    const rows = await c.env.DB.prepare(
-
-      'SELECT * FROM queue WHERE date=? ORDER BY number ASC'
-
-    ).bind(today).all()
-
-    const tickets = rows.results as any[]
-
+    const tickets = await mathTickets(c.env.DB, getKSTDate())
     const waiting = tickets.filter((r) => r.status === 'waiting').length
-
     const answering = tickets.filter((r) => r.status === 'answering').length
-
     const done = tickets.filter((r) => r.status === 'done').length
-
     return c.json({ success: true, total: tickets.length, waiting, answering, done, tickets })
-
   } catch (e: any) {
-
     return c.json({ success: false, error: e.message }, 500)
-
   }
-
 })
 
-
-
-// 번호표 상태 변경 (관리자) - waiting→answering→done
-
+// 번호표 상태 변경 (관리자) - waiting→answering(쏘이지 called)→done
 app.post('/api/admin/queue/:id/status', async (c) => {
-
   try {
-
     const id = c.req.param('id')
-
     const { status } = await c.req.json()
-
     if (!['waiting','answering','done'].includes(status))
-
       return c.json({ success: false, error: '잘못된 상태값' }, 400)
-
-    await c.env.DB.prepare('UPDATE queue SET status=?, called=? WHERE id=?')
-
-      .bind(status, status === 'done' ? 2 : status === 'answering' ? 1 : 0, id).run()
-
-    // 호출(answering)로 바뀌면 키오스크 음성 방송 큐에 "(이름) 차례입니다" 추가
+    const db = c.env.DB
+    await ensureClassQueue(db)
+    const now = Date.now()
+    if (status === 'answering') await db.prepare("UPDATE class_queue SET status='called', raised=0, called_at=? WHERE id=?").bind(now, id).run()
+    else if (status === 'done') await db.prepare("UPDATE class_queue SET status='done', raised=0, done_at=? WHERE id=?").bind(now, id).run()
+    else await db.prepare("UPDATE class_queue SET status='waiting' WHERE id=?").bind(id).run()
+    // 호출로 바뀌면 키오스크 음성 방송 큐에 "(이름) 차례입니다" 추가
     if (status === 'answering') {
       try {
-        const row = await c.env.DB.prepare('SELECT student_name FROM queue WHERE id=?').bind(id).first() as any
-        if (row?.student_name) await pushAnnounce(c.env.DB, row.student_name + ' 학생 차례입니다.')
+        const row = await db.prepare('SELECT student_name FROM class_queue WHERE id=?').bind(id).first() as any
+        if (row?.student_name) await pushAnnounce(db, row.student_name + ' 학생 차례입니다.')
       } catch (_) {}
     }
-
     return c.json({ success: true })
-
   } catch (e: any) {
-
     return c.json({ success: false, error: e.message }, 500)
-
   }
-
 })
 
 
@@ -1528,13 +1445,7 @@ app.get('/api/admin/queue', async (c) => {
 
     const date = c.req.query('date') || getKSTDate()
 
-    const rows = await c.env.DB.prepare(
-
-      'SELECT * FROM queue WHERE date=? ORDER BY number ASC'
-
-    ).bind(date).all()
-
-    return c.json({ success: true, tickets: rows.results, date })
+    return c.json({ success: true, tickets: await mathTickets(c.env.DB, date), date })
 
   } catch (e: any) {
 
@@ -4323,6 +4234,8 @@ window.selectQueueStudent = async function(id) {
       msgText.textContent = '앞에 ' + data.waiting + '명이 기다리고 있어요!'
 
     }
+
+    if (data.existing) msgText.textContent = '이미 뽑은 번호표예요. ' + msgText.textContent
 
 
 
