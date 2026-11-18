@@ -544,6 +544,8 @@ app.post('/api/admin/shop/restock', async (c) => {
 // 학생 목록 (포인트 + 벌금 유형별 집계 포함)
 
 app.get('/api/students', async (c) => {
+  // ?with=mid: 번호표 화면만 중등 수학생도 넣는다(2026-11-19 지현, 중등 수학 도전). 상점·포인트 화면은 그대로 초등만.
+  const withMid = c.req.query('with') === 'mid'
   try {
     // 수업관리 앱과 공유하는 과목 정보 테이블 (없으면 생성 — 명단이 항상 뜨도록 하는 안전장치)
     await c.env.DB.prepare("CREATE TABLE IF NOT EXISTS class_student_meta (student_id TEXT PRIMARY KEY, online_id TEXT NOT NULL DEFAULT '', subjects TEXT NOT NULL DEFAULT '', english_band TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0)").run()
@@ -564,10 +566,10 @@ app.get('/api/students', async (c) => {
         AND s.status = '재원' AND COALESCE(s.hidden, 0) = 0
         AND (m.math_end IS NULL OR m.math_end = '' OR m.math_end >= date('now', '+9 hours'))
         AND s.name NOT LIKE '테스트%' AND s.name NOT LIKE '테스터%' AND COALESCE(s.school, '') NOT LIKE '바꿈%'
-        -- 키오스크는 초등만
-        AND COALESCE(s.grade, '') NOT LIKE '중%' AND COALESCE(s.grade, '') NOT LIKE '고%')
+        -- 키오스크는 초등만(번호표 화면은 중등까지)
+        AND (? = 1 OR COALESCE(s.grade, '') NOT LIKE '중%') AND COALESCE(s.grade, '') NOT LIKE '고%')
       GROUP BY s.id ORDER BY s.name
-    `).all()
+    `).bind(withMid ? 1 : 0).all()
     return c.json({ success: true, students: rows.results })
   } catch (e: any) {
     return c.json({ success: false, error: e.message }, 500)
@@ -4159,11 +4161,14 @@ function stopQueueSelPoll(){ if(queueSelTimer){clearInterval(queueSelTimer);queu
 
 // 번호표 학생 그리드 렌더
 
-function renderQueueStudents() {
+var QSTUDENTS = []  // 번호표 화면 명단 = 초등 + 중등 수학생
+async function renderQueueStudents() {
 
   const g = document.getElementById('queueStudentGrid')
+  try { const d = await (await fetch('/api/students?with=mid')).json(); if (d.success) QSTUDENTS = d.students } catch (e) {}
+  if (!QSTUDENTS.length) QSTUDENTS = STUDENTS
 
-  g.innerHTML = STUDENTS.map(s => {
+  g.innerHTML = QSTUDENTS.map(s => {
 
     const photoEl = s.photo_url
 
@@ -4201,7 +4206,7 @@ var QUEUE_REASONS = ['수학 도전', '화면이 이상해요', '이해가 안 �
 var QUEUE_KIND = 'draw'
 // 학생을 누르면 — 오늘 안 끝난 번호표가 있으면 그걸 보여 주고(손들기·취소), 없으면 사유 고르고 뽑기. 쏘이지 번호표 카드와 같은 흐름.
 window.selectQueueStudent = async function(id) {
-  const s = STUDENTS.find(x => x.id === id); if (!s) return
+  const s = QSTUDENTS.find(x => x.id === id) || STUDENTS.find(x => x.id === id); if (!s) return
   QUEUE_STUDENT = s
   showQueueResult(s)
   try {
