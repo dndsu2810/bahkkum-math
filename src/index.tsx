@@ -1262,8 +1262,9 @@ async function mathTickets(db: D1Database, date: string) {
 
 app.post('/api/queue/draw', async (c) => {
   try {
-    const { studentName } = await c.req.json()
+    const { studentName, reason: rawReason } = await c.req.json()
     if (!studentName) return c.json({ success: false, error: '이름 필요' }, 400)
+    const reason = String(rawReason ?? '').trim().slice(0, 200)
     const db = c.env.DB
     await ensureClassQueue(db)
     const today = getKSTDate()
@@ -1272,12 +1273,14 @@ app.post('/api/queue/draw', async (c) => {
     const sid = String(stu.id)
     let t = await db.prepare("SELECT number FROM class_queue WHERE subject='math' AND student_id=? AND date=? AND status!='done' ORDER BY created_at DESC LIMIT 1").bind(sid, today).first() as any
     const existing = !!t
+    // 이미 줄 서 있으면 새 사유로 바꾼다(쏘이지와 같음 — "수학 도전"으로 바꾸면 도전 태블릿에 뜬다)
+    if (t && reason) await db.prepare("UPDATE class_queue SET reason=? WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(reason, sid, today).run()
     if (!t) {
       const mx = await db.prepare("SELECT COALESCE(MAX(number),0)+1 n FROM class_queue WHERE subject='math' AND date=?").bind(today).first() as any
       const number = Number(mx?.n ?? 1)
       const id = 'q_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-      await db.prepare("INSERT INTO class_queue(id,subject,student_id,student_name,number,date,status,raised,created_at,reason) VALUES(?,'math',?,?,?,?,'waiting',0,?,'')")
-        .bind(id, sid, stu.name, number, today, Date.now()).run()
+      await db.prepare("INSERT INTO class_queue(id,subject,student_id,student_name,number,date,status,raised,created_at,reason) VALUES(?,'math',?,?,?,?,'waiting',0,?,?)")
+        .bind(id, sid, stu.name, number, today, Date.now(), reason).run()
       t = { number }
     }
     const a = await db.prepare("SELECT COUNT(*) n FROM class_queue WHERE subject='math' AND date=? AND status!='done' AND number<?").bind(today, t.number).first() as any
@@ -2691,6 +2694,17 @@ const MAIN_HTML = `<!DOCTYPE html>
 </div>
 
 
+
+<!-- 번호표 사유 고르기 — 쏘이지 수학 번호표와 같은 사유(QueueCard MATH_REASONS). "수학 도전"이어야 수학 도전 태블릿에 뜬다 -->
+<div class="modal-ov" id="queue-reason-modal">
+  <div class="modal-box" style="max-width:420px;">
+    <div class="modal-title"><span data-ic="ticket" data-sz="22"></span>무슨 일로 부르나요?</div>
+    <div id="queueReasonChips" style="display:flex;flex-direction:column;gap:8px;margin:12px 0;"></div>
+    <div class="modal-btns">
+      <button class="btn-mc" style="flex:1;" onclick="closeQueueReason()">취소</button>
+    </div>
+  </div>
+</div>
 
 <!-- 내 상태 모달 -->
 
@@ -4123,7 +4137,18 @@ window.filterQueueStudents = function(q) {
 
 // 학생 선택 후 번호표 발급
 
-window.selectQueueStudent = async function(id) {
+var QUEUE_REASONS = ['수학 도전', '화면이 이상해요', '이해가 안 돼요', '문제가 어려워요', '설명이 더 필요해요']
+window.selectQueueStudent = function(id) {
+  const s = STUDENTS.find(x => x.id === id); if (!s) return
+  document.getElementById('queueReasonChips').innerHTML = QUEUE_REASONS.map(function(r, i){
+    return '<button class="btn-mok" style="flex:none;width:100%;" onclick="pickQueueReason(' + id + ',' + i + ')">' + escHtml(r) + '</button>'
+  }).join('')
+  document.getElementById('queue-reason-modal').classList.add('open')
+}
+window.closeQueueReason = function(){ document.getElementById('queue-reason-modal').classList.remove('open') }
+window.pickQueueReason = function(id, i){ closeQueueReason(); drawQueueTicket(id, QUEUE_REASONS[i] || '') }
+
+async function drawQueueTicket(id, reason) {
 
   const s = STUDENTS.find(x => x.id === id); if (!s) return
 
@@ -4161,7 +4186,7 @@ window.selectQueueStudent = async function(id) {
 
       headers: {'Content-Type':'application/json'},
 
-      body: JSON.stringify({ studentName: s.name })
+      body: JSON.stringify({ studentName: s.name, reason: reason })
 
     })
 
