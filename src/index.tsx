@@ -1260,32 +1260,82 @@ async function mathTickets(db: D1Database, date: string) {
   return (rows.results as any[]).map(kioskTicket)
 }
 
+// 쏘이지 worker/queue.ts와 같은 규칙: mine(내 번호표+앞 인원) · draw · raise(손들기) · cancel. 학생은 이름으로 찾는다(students.name UNIQUE).
+async function queueStudent(db: D1Database, name: unknown) {
+  if (!name) return null
+  return await db.prepare('SELECT id, name FROM students WHERE name=?').bind(String(name)).first() as any
+}
+async function myMathTicket(db: D1Database, sid: string, date: string) {
+  const t = await db.prepare("SELECT number,status,raised,called_at FROM class_queue WHERE subject='math' AND student_id=? AND date=? AND status!='done' ORDER BY created_at DESC LIMIT 1").bind(sid, date).first() as any
+  if (!t) return null
+  const a = await db.prepare("SELECT COUNT(*) n FROM class_queue WHERE subject='math' AND date=? AND status!='done' AND number<?").bind(date, t.number).first() as any
+  return { number: Number(t.number), status: String(t.status), ahead: Number(a?.n ?? 0), raised: !!t.raised, calledAt: Number(t.called_at ?? 0) }
+}
+const NO_STUDENT = { success: false, error: 'no_student', message: '학생을 찾지 못했어요. 선생님께 말해 주세요.' }
+
+app.get('/api/queue/mine', async (c) => {
+  try {
+    await ensureClassQueue(c.env.DB)
+    const stu = await queueStudent(c.env.DB, c.req.query('name'))
+    if (!stu) return c.json(NO_STUDENT)
+    return c.json({ success: true, ticket: await myMathTicket(c.env.DB, String(stu.id), getKSTDate()) })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message }, 500)
+  }
+})
+
 app.post('/api/queue/draw', async (c) => {
   try {
     const { studentName, reason: rawReason } = await c.req.json()
-    if (!studentName) return c.json({ success: false, error: '이름 필요' }, 400)
     const reason = String(rawReason ?? '').trim().slice(0, 200)
     const db = c.env.DB
     await ensureClassQueue(db)
     const today = getKSTDate()
-    const stu = await db.prepare('SELECT id, name FROM students WHERE name=?').bind(studentName).first() as any
-    if (!stu) return c.json({ success: false, error: 'no_student', message: '학생을 찾지 못했어요. 선생님께 말해 주세요.' })
+    const stu = await queueStudent(db, studentName)
+    if (!stu) return c.json(NO_STUDENT)
     const sid = String(stu.id)
-    let t = await db.prepare("SELECT number FROM class_queue WHERE subject='math' AND student_id=? AND date=? AND status!='done' ORDER BY created_at DESC LIMIT 1").bind(sid, today).first() as any
-    const existing = !!t
+    const existing = await myMathTicket(db, sid, today)
     // 이미 줄 서 있으면 새 사유로 바꾼다(쏘이지와 같음 — "수학 도전"으로 바꾸면 도전 태블릿에 뜬다)
-    if (t && reason) await db.prepare("UPDATE class_queue SET reason=? WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(reason, sid, today).run()
-    if (!t) {
+    if (existing && reason) await db.prepare("UPDATE class_queue SET reason=? WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(reason, sid, today).run()
+    if (!existing) {
       const mx = await db.prepare("SELECT COALESCE(MAX(number),0)+1 n FROM class_queue WHERE subject='math' AND date=?").bind(today).first() as any
-      const number = Number(mx?.n ?? 1)
       const id = 'q_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
       await db.prepare("INSERT INTO class_queue(id,subject,student_id,student_name,number,date,status,raised,created_at,reason) VALUES(?,'math',?,?,?,?,'waiting',0,?,?)")
-        .bind(id, sid, stu.name, number, today, Date.now(), reason).run()
-      t = { number }
+        .bind(id, sid, stu.name, Number(mx?.n ?? 1), today, Date.now(), reason).run()
     }
-    const a = await db.prepare("SELECT COUNT(*) n FROM class_queue WHERE subject='math' AND date=? AND status!='done' AND number<?").bind(today, t.number).first() as any
-    const waiting = Number(a?.n ?? 0)
-    return c.json({ success: true, number: t.number, waiting, date: today, existing })
+    return c.json({ success: true, ticket: await myMathTicket(db, sid, today), date: today, existing: !!existing })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message }, 500)
+  }
+})
+
+app.post('/api/queue/raise', async (c) => {
+  try {
+    const { studentName, reason: rawReason } = await c.req.json()
+    const reason = String(rawReason ?? '').trim().slice(0, 200)
+    const db = c.env.DB
+    await ensureClassQueue(db)
+    const stu = await queueStudent(db, studentName)
+    if (!stu) return c.json(NO_STUDENT)
+    const today = getKSTDate()
+    // 손들 때 새 사유를 적었으면 갱신, 비워 뒀으면 뽑을 때 사유 유지
+    if (reason) await db.prepare("UPDATE class_queue SET raised=1, reason=? WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(reason, String(stu.id), today).run()
+    else await db.prepare("UPDATE class_queue SET raised=1 WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(String(stu.id), today).run()
+    return c.json({ success: true, ticket: await myMathTicket(db, String(stu.id), today) })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message }, 500)
+  }
+})
+
+app.post('/api/queue/cancel', async (c) => {
+  try {
+    const { studentName } = await c.req.json()
+    const db = c.env.DB
+    await ensureClassQueue(db)
+    const stu = await queueStudent(db, studentName)
+    if (!stu) return c.json(NO_STUDENT)
+    await db.prepare("UPDATE class_queue SET status='done', done_at=? WHERE subject='math' AND student_id=? AND date=? AND status!='done'").bind(Date.now(), String(stu.id), getKSTDate()).run()
+    return c.json({ success: true })
   } catch (e: any) {
     return c.json({ success: false, error: e.message }, 500)
   }
@@ -2673,6 +2723,12 @@ const MAIN_HTML = `<!DOCTYPE html>
 
 
 
+    <!-- 내 번호표 손들기·취소 (쏘이지 번호표 카드와 같음) -->
+    <div id="queueActions" style="display:none;gap:9px;width:100%;max-width:500px;">
+      <button class="btn-mok" style="flex:1;" id="queueRaiseBtn" onclick="openQueueReason('raise')">손들기</button>
+      <button class="btn-mc" style="flex:1;" onclick="cancelQueueTicket()">번호표 취소</button>
+    </div>
+
     <!-- 오늘의 번호표 목록 -->
 
     <div class="queue-ticket-list" id="queueTicketList"></div>
@@ -2698,8 +2754,12 @@ const MAIN_HTML = `<!DOCTYPE html>
 <!-- 번호표 사유 고르기 — 쏘이지 수학 번호표와 같은 사유(QueueCard MATH_REASONS). "수학 도전"이어야 수학 도전 태블릿에 뜬다 -->
 <div class="modal-ov" id="queue-reason-modal">
   <div class="modal-box" style="max-width:420px;">
-    <div class="modal-title"><span data-ic="ticket" data-sz="22"></span>무슨 일로 부르나요?</div>
+    <div class="modal-title"><span data-ic="ticket" data-sz="22"></span><span id="queueReasonTitle">무슨 일로 부르나요?</span></div>
     <div id="queueReasonChips" style="display:flex;flex-direction:column;gap:8px;margin:12px 0;"></div>
+    <div id="queueReasonType" style="display:none;gap:8px;margin:0 0 12px;">
+      <input class="search-inp" id="queueReasonInp" type="text" maxlength="200" placeholder="무슨 일로 부르나요? (선택)" style="flex:1;">
+      <button class="btn-mok" style="flex:none;padding:13px 18px;" onclick="submitQueueReason()" id="queueReasonGo">뽑기</button>
+    </div>
     <div class="modal-btns">
       <button class="btn-mc" style="flex:1;" onclick="closeQueueReason()">취소</button>
     </div>
@@ -4138,147 +4198,100 @@ window.filterQueueStudents = function(q) {
 // 학생 선택 후 번호표 발급
 
 var QUEUE_REASONS = ['수학 도전', '화면이 이상해요', '이해가 안 돼요', '문제가 어려워요', '설명이 더 필요해요']
-window.selectQueueStudent = function(id) {
+var QUEUE_KIND = 'draw'
+// 학생을 누르면 — 오늘 안 끝난 번호표가 있으면 그걸 보여 주고(손들기·취소), 없으면 사유 고르고 뽑기. 쏘이지 번호표 카드와 같은 흐름.
+window.selectQueueStudent = async function(id) {
   const s = STUDENTS.find(x => x.id === id); if (!s) return
+  QUEUE_STUDENT = s
+  showQueueResult(s)
+  try {
+    const d = await (await fetch('/api/queue/mine?name=' + encodeURIComponent(s.name))).json()
+    if (!d.success) { showQueueError(d.message || '번호표를 불러오지 못했어요.'); return }
+    if (d.ticket) { renderQueueTicket(d.ticket, false); return }
+    goQueueSelect()
+    openQueueReason('draw')
+  } catch (e) { showQueueError('인터넷 연결을 확인하고 다시 눌러 주세요.') }
+}
+function goQueueSelect(){
+  document.getElementById('queue-step-result').style.display = 'none'
+  document.getElementById('queue-step-select').style.display = 'block'
+  startQueueSelPoll()
+}
+function showQueueResult(s){
+  document.getElementById('queue-step-select').style.display = 'none'
+  document.getElementById('queue-step-result').style.display = 'flex'
+  stopQueueSelPoll()
+  document.getElementById('queueNumber').textContent = '...'
+  document.getElementById('queueStuName').textContent = s.name
+  document.getElementById('queueDate').textContent = ''
+  document.getElementById('queueWaiting').textContent = '-'
+  document.getElementById('queueTotal').textContent = '-'
+  document.getElementById('queueActions').style.display = 'none'
+}
+function setQueueMsg(kind, ic, text){
+  document.getElementById('queueMsgBox').className = 'queue-msg-box ' + kind
+  document.querySelector('#queueMsgBox .queue-msg-icon').innerHTML = icon(ic, 24, 'currentColor')
+  document.getElementById('queueMsgText').textContent = text
+}
+function showQueueError(msg){
+  document.getElementById('queueNumber').textContent = '!'
+  setQueueMsg('warn', 'warn', msg)
+  loadQueueStatus(null)
+}
+function renderQueueTicket(t, fresh){
+  document.getElementById('queueNumber').textContent = t.number
+  document.getElementById('queueDate').textContent = fresh ? '방금 뽑았어요' : '오늘 뽑은 번호표'
+  if (t.status === 'called') setQueueMsg('ok', 'check', '내 차례예요! 선생님께 가요.')
+  else if (t.ahead === 0) setQueueMsg('ok', 'check', '곧 내 차례예요')
+  else setQueueMsg('info', t.ahead <= 2 ? 'clock' : 'ticket', '앞에 ' + t.ahead + '명 남았어요')
+  const rb = document.getElementById('queueRaiseBtn')
+  rb.style.display = t.status === 'called' ? 'none' : ''
+  rb.disabled = !!t.raised
+  rb.textContent = t.raised ? '손든 중' : '손들기'
+  document.getElementById('queueActions').style.display = 'flex'
+  loadQueueStatus(t.number)
+}
+window.openQueueReason = function(kind){
+  QUEUE_KIND = kind
+  document.getElementById('queueReasonTitle').textContent = kind === 'raise' ? '왜 손을 드나요?' : '무슨 일로 부르나요?'
+  document.getElementById('queueReasonGo').textContent = kind === 'raise' ? '손들기' : '뽑기'
   document.getElementById('queueReasonChips').innerHTML = QUEUE_REASONS.map(function(r, i){
-    return '<button class="btn-mok" style="flex:none;width:100%;" onclick="pickQueueReason(' + id + ',' + i + ')">' + escHtml(r) + '</button>'
-  }).join('')
+    return '<button class="btn-mok" style="flex:none;width:100%;" onclick="submitQueueReason(' + i + ')">' + escHtml(r) + '</button>'
+  }).join('') + '<button class="btn-mc" style="width:100%;" onclick="typeQueueReason()">직접 적기</button>'
+  document.getElementById('queueReasonType').style.display = 'none'
+  document.getElementById('queueReasonInp').value = ''
   document.getElementById('queue-reason-modal').classList.add('open')
 }
-window.closeQueueReason = function(){ document.getElementById('queue-reason-modal').classList.remove('open') }
-window.pickQueueReason = function(id, i){ closeQueueReason(); drawQueueTicket(id, QUEUE_REASONS[i] || '') }
-
-async function drawQueueTicket(id, reason) {
-
-  const s = STUDENTS.find(x => x.id === id); if (!s) return
-
-  QUEUE_STUDENT = s
-
-
-
-  // 단계 전환 (결과 화면으로)
-
-  document.getElementById('queue-step-select').style.display = 'none'
-
-  document.getElementById('queue-step-result').style.display = 'flex'
-
-  stopQueueSelPoll()   // 결과 화면에선 별도 현황(loadQueueStatus) 사용
-
-
-
-  // 임시 로딩 표시
-
-  document.getElementById('queueNumber').textContent = '...'
-
-  document.getElementById('queueStuName').textContent = s.name
-
-  document.getElementById('queueWaiting').textContent = '-'
-
-  document.getElementById('queueTotal').textContent = '-'
-
-
-
-  try {
-
-    const res = await fetch('/api/queue/draw', {
-
-      method: 'POST',
-
-      headers: {'Content-Type':'application/json'},
-
-      body: JSON.stringify({ studentName: s.name, reason: reason })
-
-    })
-
-    const data = await res.json()
-
-
-
-    if (!data.success) {
-
-      // 오류 처리
-
-      const msgBox = document.getElementById('queueMsgBox')
-
-      const msgText = document.getElementById('queueMsgText')
-
-      msgBox.className = 'queue-msg-box warn'
-
-      document.querySelector('#queueMsgBox .queue-msg-icon').innerHTML = data.error === 'consecutive' ? icon('consult',24,'currentColor') : icon('warn',24,'currentColor')
-
-      msgText.textContent = data.message || '번호표를 발급할 수 없어요.'
-
-      document.getElementById('queueNumber').textContent = '!'
-
-      // 현황 불러오기
-
-      await loadQueueStatus(null)
-
-      return
-
-    }
-
-
-
-    // 성공
-
-    document.getElementById('queueNumber').textContent = data.number
-
-    document.getElementById('queueDate').textContent = data.date + ' 발급'
-
-
-
-    const msgBox = document.getElementById('queueMsgBox')
-
-    const msgText = document.getElementById('queueMsgText')
-
-
-
-    if (data.waiting === 0) {
-
-      msgBox.className = 'queue-msg-box ok'
-
-      document.querySelector('#queueMsgBox .queue-msg-icon').innerHTML = icon('check',24,'currentColor')
-
-      msgText.textContent = '첫 번째 바로 이용할 수 있어요!'
-
-    } else if (data.waiting <= 2) {
-
-      msgBox.className = 'queue-msg-box info'
-
-      document.querySelector('#queueMsgBox .queue-msg-icon').innerHTML = icon('clock',24,'currentColor')
-
-      msgText.textContent = '앞에 ' + data.waiting + '명 있어요. 거의 다 왔어요!'
-
-    } else {
-
-      msgBox.className = 'queue-msg-box info'
-
-      document.querySelector('#queueMsgBox .queue-msg-icon').innerHTML = icon('ticket',24,'currentColor')
-
-      msgText.textContent = '앞에 ' + data.waiting + '명이 기다리고 있어요!'
-
-    }
-
-    if (data.existing) msgText.textContent = '이미 뽑은 번호표예요. ' + msgText.textContent
-
-
-
-    await loadQueueStatus(data.number)
-
-
-
-  } catch (err) {
-
-    document.getElementById('queueNumber').textContent = '!'
-
-    document.getElementById('queueMsgText').textContent = '네트워크 오류가 발생했어요.'
-
-  }
-
+window.typeQueueReason = function(){
+  document.getElementById('queueReasonType').style.display = 'flex'
+  document.getElementById('queueReasonInp').focus()
 }
-
-
+window.closeQueueReason = function(){ document.getElementById('queue-reason-modal').classList.remove('open') }
+window.submitQueueReason = async function(i){
+  const reason = typeof i === 'number' ? (QUEUE_REASONS[i] || '') : document.getElementById('queueReasonInp').value.trim()
+  closeQueueReason()
+  const s = QUEUE_STUDENT; if (!s) return
+  showQueueResult(s)
+  try {
+    const d = await (await fetch('/api/queue/' + (QUEUE_KIND === 'raise' ? 'raise' : 'draw'), {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ studentName: s.name, reason: reason })
+    })).json()
+    if (!d.success || !d.ticket) { showQueueError(d.message || '번호표를 뽑지 못했어요. 다시 눌러 주세요.'); return }
+    renderQueueTicket(d.ticket, QUEUE_KIND === 'draw' && !d.existing)
+  } catch (e) { showQueueError('인터넷 연결을 확인하고 다시 눌러 주세요.') }
+}
+window.cancelQueueTicket = async function(){
+  const s = QUEUE_STUDENT; if (!s) return
+  try {
+    const d = await (await fetch('/api/queue/cancel', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ studentName: s.name }) })).json()
+    if (!d.success) { showQueueError(d.message || '취소하지 못했어요. 다시 눌러 주세요.'); return }
+    document.getElementById('queueNumber').textContent = '-'
+    document.getElementById('queueActions').style.display = 'none'
+    setQueueMsg('info', 'check', '번호표를 취소했어요')
+    loadQueueStatus(null)
+  } catch (e) { showQueueError('인터넷 연결을 확인하고 다시 눌러 주세요.') }
+}
 
 // 현황 조회 및 목록 표시
 
@@ -4296,7 +4309,7 @@ async function loadQueueStatus(myNumber) {
 
     document.getElementById('queueWaiting').textContent = myNumber
 
-      ? (data.tickets.filter(t => !t.called && t.number < myNumber).length) + '명'
+      ? (data.tickets.filter(t => t.status !== 'done' && t.number < myNumber).length) + '명'
 
       : (data.waiting + '명')
 
